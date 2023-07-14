@@ -60,33 +60,43 @@ class StravaCleaner:
             return activities_clean
 
     @staticmethod
-    def clean_activity_streams(activity_streams: list) -> pd.DataFrame:
+    def clean_activity_streams(activity_streams: list, progress_bar: bool = True, file: str = None) -> pd.DataFrame:
         """
         Cleans activity streams into a Pandas DataFrame
 
         :param activity_streams: List of activity streams to process
+        :param progress_bar: Boolean indicating whether a progress bar is displayed
+        :param file: Location to save the cleaned data to
         :return: Pandas DataFrame containing activity stream information
         """
         streams = []
 
-        for idx, activity_stream in enumerate(activity_streams):
-            data = dict()
-            for stream in activity_stream:  # Multiple types (e.g. distance, elevation, latlng)
-                if stream["type"] == "latlng":
-                    data["latitude"] = [x[0] for x in stream["data"]]
-                    data["longitude"] = [x[1] for x in stream["data"]]
-                elif stream["type"] == "altitude":
-                    data["elevation"] = stream["data"]
-                else:
-                    data[stream["type"]] = stream["data"]
+        with tqdm(total=len(activity_streams)) as pbar:
+            for idx, activity_stream in enumerate(activity_streams):
+                pbar.set_description(f"Processing stream {activity_stream[0]['activity_id']}")
+                data = dict()
+                for stream in activity_stream:  # Multiple types (e.g. distance, elevation, latlng)
+                    if stream["type"] == "latlng":
+                        data["latitude"] = [x[0] for x in stream["data"]]
+                        data["longitude"] = [x[1] for x in stream["data"]]
+                    elif stream["type"] == "altitude":
+                        data["elevation"] = stream["data"]
+                    else:
+                        data[stream["type"]] = stream["data"]
 
                 data["activity_id"] = stream["activity_id"]
 
-            streams.append(pd.DataFrame(data))
+                streams.append(pd.DataFrame(data))
+                pbar.update(1)
 
-        return pd.concat(streams)[[
+        streams = pd.concat(streams)[[
             "activity_id", "time", "distance", "elevation", "latitude", "longitude"
         ]]
+
+        if file:
+            streams.to_pickle(file)
+
+        return streams
 
     @staticmethod
     def create_gpx_files(activities: pd.DataFrame, activity_streams: pd.DataFrame, save_dir: str) -> None:

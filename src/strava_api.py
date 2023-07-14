@@ -84,6 +84,9 @@ class StravaClient:
                 params={"keys": "time,latlng,altitude"}  # Docs say array, but this doesn't return streams as expected
             )
 
+            for substream in stream:
+                substream["activity_id"] = activity_id
+
             activity_streams.append(stream)
 
         if file is not None:
