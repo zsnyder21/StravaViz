@@ -317,11 +317,12 @@ if __name__ == "__main__":
     from dotenv import load_dotenv
     load_dotenv()
 
-    vis = StravaVisualizer(api_key=os.getenv("GEOMAPIFY_API_KEY"))
+    vis = StravaVisualizer(api_key=os.getenv("GEOAPIFY_API_KEY"))
 
     vis.generate_heatmap(
         gpx_dir="../data/gpx/",
-        zoom=15,
+        file="../img/heatmap_example.png",
+        zoom=-1,
         sigma=1,
         lat_lon_bounds=(39.813811, -105.558014, 40.166281, -105.195465)  # Boulder
         # lat_lon_bounds=(37.788624, -122.392159, 37.895718, -122.219810)  # Oakland
