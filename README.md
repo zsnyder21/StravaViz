@@ -1,3 +1,8 @@
+- [Motivation](#motivation)
+- [Data](#data)
+- [Heatmap](#heatmap)
+- [Executing Example Code](#executing-example-code)
+
 # Motivation
 I wanted to use Strava's API to gain access to my activity data, particularly the GPS track information. I wasn't
 terribly happy with how Strava rendered my data into a heatmap on their website, so I figured I'd give it a try here.
@@ -33,6 +38,8 @@ manually inverted the color scheme after stitching them together for a dark look
 Laying my tracks on top of these stitched tiles turned out pretty well in my opinion.
 <img src="./img/heatmap.png">
 
-# Generation
+# Executing Example Code
 I've added an example Jupyter notebook that goes through the process of generating one of these heatmaps from end to
-end starting from data acquisition to heatmap generation.
+end starting from data acquisition to heatmap generation. Note that if you are running the example notebook with the
+data I've provided, you will want to comment/uncomment cells 3 and 4 respectively, as well as code cells  7 and 8. This
+way the code will just read the stored data instead of trying to fetch it again.
