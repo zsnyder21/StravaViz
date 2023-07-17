@@ -122,46 +122,48 @@ class StravaVisualizer:
 
         return True
 
-    def generate_heatmap(
-            self,
+    @staticmethod
+    def _process_gpx_files(
             gpx_dir: str,
-            file: str,
-            zoom: int = -1,
-            sigma: int = 1,
             year_filter: int = None,
             lat_lon_bounds: tuple[float, float, float, float] = (-90.0, 90.0, -180.0, 180.0)
-    ) -> np.ndarray:
+    ) -> tuple[np.ndarray, int]:
         """
-        Generate a heatmap using GPX files in a specified directory
+        Iterates through the GPX files in the passed directory and extracts the lat/lon data from them
 
-        :param gpx_dir: Directory containing the gpx files (consumes all .gpx files)
-        :param file: Location to save the heatmap to
-        :param zoom: Zoom level to use when fetching map tiles
-        :param sigma: Width of the strava tracks
-        :param year_filter: Only use activities for this year
-        :param lat_lon_bounds: Bounding latitudes/longitudes describing the map
-        :return: NumPy array representation of the heatmap image
+        :param gpx_dir: Directory containing the GPX files
+        :param year_filter: Use only GPX tracks with this year
+        :param lat_lon_bounds: The latitude/longitude boundaries to use when filtering the GPX files
+        :return: NumPy array containing the lat/lon data and an integer number of tracks used
         """
         gpx_files = glob.glob(f"{gpx_dir}/*.gpx")
+        lat_bound_min, lon_bound_min, lat_bound_max, lon_bound_max = lat_lon_bounds
 
         if not gpx_files:
             raise ValueError(f"Error: No GPX files found within {gpx_dir}")
 
         lat_lon_data = []
+        track_count = 0
         with tqdm(total=len(gpx_files)) as pbar:
             for gpx_file in gpx_files:
                 pbar.set_description(f"Processing {os.path.basename(gpx_file)}")
 
                 with open(gpx_file, encoding="utf-8") as f:
+                    counted = False
                     for line in f.readlines():
                         if "<time" in line:
                             year = line.split(">")[1][:4]
 
                         if year_filter is None or year == year_filter:
                             if "<trkpt" in line:
-                                l = line.split('"')
+                                lat_lon = line.split('"')
 
-                                lat_lon_data.append([float(l[1]), float(l[3])])
+                                lat, lon = float(lat_lon[1]), float(lat_lon[3])
+                                if (lat_bound_min < lat < lat_bound_max) and (lon_bound_min < lon < lon_bound_max):
+                                    lat_lon_data.append([lat, lon])
+                                    track_count += not counted
+                                    counted = True
+
                         else:
                             break
 
@@ -172,27 +174,21 @@ class StravaVisualizer:
         if lat_lon_data.size == 0:
             raise ValueError(f"Error: No lat/lon data found matching filter criteria")
 
-        # Crop bounding box
-        lat_bound_min, lon_bound_min, lat_bound_max, lon_bound_max = lat_lon_bounds
-        lat_lon_data = lat_lon_data[
-                       np.logical_and(
-                           lat_lon_data[:, 0] > lat_bound_min,
-                           lat_lon_data[:, 0] < lat_bound_max
-                       ), :]
-        lat_lon_data = lat_lon_data[
-                       np.logical_and(
-                           lat_lon_data[:, 1] > lon_bound_min,
-                           lat_lon_data[:, 1] < lon_bound_max
-                       ), :]
+        return lat_lon_data, track_count
 
-        if lat_lon_data.size == 0:
-            raise ValueError(f"Error: No data within bounds ({lat_lon_bounds})")
+    def _enumerate_tiles(self, lat_lon_data: np.ndarray, zoom: int) -> tuple[int, int, int, int, int]:
+        """
+        Auto zoom if necessary, and enumerate which map tiles we will need
 
+        :param lat_lon_data: NumPy array containing the lat/lon data
+        :param zoom: Zoom level specified
+        :return: Tuple containing zoom, x_min, x_max, y_min, y_max
+        """
         # Find tile coordinates
         lat_min, lon_min = np.min(lat_lon_data, axis=0)
         lat_max, lon_max = np.max(lat_lon_data, axis=0)
 
-        # Zoom
+        # Handle auto zoom
         if zoom > -1:
             zoom = min(zoom, self.OPEN_STREET_MAPS_MAX_ZOOM)
 
@@ -213,12 +209,24 @@ class StravaVisualizer:
                     break
 
                 zoom -= 1
-            print(f"Auto zoom = {zoom}")
+            print(f"Auto zoom set to {zoom}")
 
+        return zoom, x_min, x_max, y_min, y_max
+
+    def _construct_base_map(self, zoom: int, x_min: int, x_max: int, y_min: int, y_max: int) -> np.ndarray:
+        """
+        Download and stitch together the map tiles
+
+        :param zoom: Zoom level
+        :param x_min: Minimum x
+        :param x_max: Maximum x
+        :param y_min: Minimum y
+        :param y_max: Maximum y
+        :return: NumPy array containing the base map to use
+        """
         tile_count = (x_max - x_min + 1) * (y_max - y_min + 1)
-
         if tile_count > self.OPEN_STREET_MAPS_MAX_TILE_COUNT:
-            raise ValueError(f"Error: Too many tiles {tile_count} would need to be downloaded")
+            raise ValueError(f"Error: Too many tiles ({tile_count}) would need to be downloaded")
 
         base_map = np.zeros((
             (y_max - y_min + 1) * self.OPEN_STREET_MAPS_TILE_SIZE,
@@ -226,12 +234,11 @@ class StravaVisualizer:
             3
         ))
 
-        n = 0
+        # Download and stitch
         with tqdm(total=tile_count) as pbar:
             pbar.set_description(f"Downloading tiles")
             for x in range(x_min, x_max + 1):
                 for y in range(y_min, y_max + 1):
-                    n += 1
                     tile_file = "../data/tiles/zoom_{}/tile_{}_{}_{}.png".format(zoom, zoom, x, y)
                     os.makedirs(os.path.dirname(tile_file), exist_ok=True)
 
@@ -260,7 +267,30 @@ class StravaVisualizer:
         base_map = 1.0 - base_map  # Invert colors
         base_map = np.dstack((base_map, base_map, base_map))  # RGB
 
-        # Insert tracks
+        return base_map
+
+    def _overlay_tracks(
+            self,
+            base_map: np.ndarray,
+            lat_lon_data: np.ndarray,
+            zoom: int,
+            x_min: int,
+            y_min: int,
+            sigma: int,
+            track_count: int
+    ) -> np.ndarray:
+        """
+        Overaly the GPS track on top of the passed map
+
+        :param base_map: The map to overlay the tracks on
+        :param lat_lon_data: The tracks
+        :param zoom: Zoom level
+        :param x_min: Minimum x
+        :param y_min: Minimum y
+        :param sigma: Pixel width of the tracks
+        :param track_count: Number of tracks used
+        :return: NumPy array containing the overlayed tracks on the passed map
+        """
         sigma_pixel = sigma
         data = np.zeros(base_map.shape[:2])
         xy_data = self.lat_long_to_osm(lat_lon_data[:, 0], lat_lon_data[:, 1], zoom)
@@ -276,7 +306,7 @@ class StravaVisualizer:
         res_pixel = 156543.03 * np.cos(np.radians(np.mean(lat_lon_data[:, 0]))) / (2 ** zoom)
 
         # Trackpoint max accumulation per pixel = 1/5 (trackpoint/meter) * res_pixel (meter/pixel) * activities
-        m = max(1.0, np.round((1.0 / 5.0) * res_pixel * len(gpx_files)))
+        m = max(1.0, np.round((1.0 / 5.0) * res_pixel * track_count))
         data[data > m] = m
 
         # Equalize histogram and compute kernel density estimation
@@ -303,14 +333,54 @@ class StravaVisualizer:
         i_max, j_max = np.max(ij_data, axis=0)
 
         base_map = base_map[
-            max(i_min - self.MARGIN_SIZE, 0):min(i_max + self.MARGIN_SIZE, base_map.shape[0]),
-            max(j_min - self.MARGIN_SIZE, 0):min(j_max + self.MARGIN_SIZE, base_map.shape[1])
-        ]
-
-        # Save
-        plt.imsave(file, base_map)
+                   max(i_min - self.MARGIN_SIZE, 0):min(i_max + self.MARGIN_SIZE, base_map.shape[0]),
+                   max(j_min - self.MARGIN_SIZE, 0):min(j_max + self.MARGIN_SIZE, base_map.shape[1])
+                   ]
 
         return base_map
+
+    def generate_heatmap(
+            self,
+            gpx_dir: str,
+            file: str,
+            zoom: int = -1,
+            sigma: int = 1,
+            year_filter: int = None,
+            lat_lon_bounds: tuple[float, float, float, float] = (-90.0, -180.0, 90.0, 180.0)
+    ) -> np.ndarray:
+        """
+        Generate a heatmap using GPX files in a specified directory
+
+        :param gpx_dir: Directory containing the gpx files (consumes all .gpx files)
+        :param file: Location to save the heatmap to
+        :param zoom: Zoom level to use when fetching map tiles
+        :param sigma: Width of the strava tracks
+        :param year_filter: Only use activities for this year
+        :param lat_lon_bounds: Bounding latitudes/longitudes describing the map
+        :return: NumPy array representation of the heatmap image
+        """
+        lat_lon_data, track_count = self._process_gpx_files(
+            gpx_dir=gpx_dir,
+            year_filter=year_filter,
+            lat_lon_bounds=lat_lon_bounds
+        )
+
+        zoom, x_min, x_max, y_min, y_max = self._enumerate_tiles(lat_lon_data=lat_lon_data, zoom=zoom)
+        base_map = self._construct_base_map(zoom=zoom, x_min=x_min, x_max=x_max, y_min=y_min, y_max=y_max)
+        heatmap = self._overlay_tracks(
+            base_map=base_map,
+            lat_lon_data=lat_lon_data,
+            zoom=zoom,
+            x_min=x_min,
+            y_min=y_min,
+            sigma=sigma,
+            track_count=track_count
+        )
+
+        # Save
+        plt.imsave(file, heatmap)
+
+        return heatmap
 
 
 if __name__ == "__main__":
@@ -322,7 +392,7 @@ if __name__ == "__main__":
     vis.generate_heatmap(
         gpx_dir="../data/gpx/",
         file="../img/heatmap_example.png",
-        zoom=-1,
+        zoom=15,
         sigma=1,
         lat_lon_bounds=(39.813811, -105.558014, 40.166281, -105.195465)  # Boulder
         # lat_lon_bounds=(37.788624, -122.392159, 37.895718, -122.219810)  # Oakland
