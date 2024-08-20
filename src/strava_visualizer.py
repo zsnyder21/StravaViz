@@ -1,13 +1,13 @@
 import glob
-import PIL
 import matplotlib.pyplot as plt
 import numpy as np
 import os
+import pandas as pd
+import PIL
 import requests
 import time
 
 from io import BytesIO
-from PIL import Image
 from tqdm.auto import tqdm
 
 
@@ -23,9 +23,10 @@ class StravaVisualizer:
     OPEN_STREET_MAPS_MAX_ZOOM = 19
     OPEN_STREET_MAPS_MAX_TILE_COUNT = 1500
 
-    def __init__(self, api_key: str = None) -> None:
+    def __init__(self, api_key: str = None, override_max_zoom: bool = False) -> None:
         self._api_key = api_key
         self.bad_urls = []
+        self._OVERRIDE_MAX_ZOOM = override_max_zoom
 
     @staticmethod
     def lat_long_to_osm(lat: float, lon: float, zoom: int) -> tuple[float, float]:
@@ -110,7 +111,7 @@ class StravaVisualizer:
             )
 
         try:
-            tile = Image.open(BytesIO(response.content))
+            tile = PIL.Image.open(BytesIO(response.content))
             tile.save(tile_file)
         except PIL.UnidentifiedImageError:
             return False
@@ -125,17 +126,20 @@ class StravaVisualizer:
     @staticmethod
     def _process_gpx_files(
             gpx_dir: str,
-            year_filter: int = None,
+            date_min: str = "1900-01-01",
+            date_max: str = "2100-12-31",
             lat_lon_bounds: tuple[float, float, float, float] = (-90.0, 90.0, -180.0, 180.0)
     ) -> tuple[np.ndarray, int]:
         """
         Iterates through the GPX files in the passed directory and extracts the lat/lon data from them
 
         :param gpx_dir: Directory containing the GPX files
-        :param year_filter: Use only GPX tracks with this year
+        :param date_min: Use only GPX tracks with dates after this date
+        :param date_max: Use only GPX tracks with dates before this date
         :param lat_lon_bounds: The latitude/longitude boundaries to use when filtering the GPX files
         :return: NumPy array containing the lat/lon data and an integer number of tracks used
         """
+        date_min, date_max = pd.to_datetime(date_min), pd.to_datetime(date_max)
         gpx_files = glob.glob(f"{gpx_dir}/*.gpx")
         lat_bound_min, lon_bound_min, lat_bound_max, lon_bound_max = lat_lon_bounds
 
@@ -148,13 +152,19 @@ class StravaVisualizer:
             for gpx_file in gpx_files:
                 pbar.set_description(f"Processing {os.path.basename(gpx_file)}")
 
+                # Determine the year the activity started
+                with open(gpx_file, encoding="utf-8") as f:
+                    for line in f.readlines():
+                        if "<time>" in line:
+                            date = pd.to_datetime(line.split(">")[1][:11])
+                            break
+
                 with open(gpx_file, encoding="utf-8") as f:
                     counted = False
                     for line in f.readlines():
-                        if "<time" in line:
-                            year = line.split(">")[1][:4]
-
-                        if year_filter is None or year == year_filter:
+                        # if "<time" in line:
+                        #     year = line.split(">")[1][:4]
+                        if date_min <= date <= date_max:
                             if "<trkpt" in line:
                                 lat_lon = line.split('"')
 
@@ -165,7 +175,7 @@ class StravaVisualizer:
                                     counted = True
 
                         else:
-                            break
+                            continue
 
                 pbar.update(1)
 
@@ -176,7 +186,7 @@ class StravaVisualizer:
 
         return lat_lon_data, track_count
 
-    def _enumerate_tiles(self, lat_lon_data: np.ndarray, zoom: int) -> tuple[int, int, int, int, int]:
+    def _enumerate_tiles(self, lat_lon_bounds: np.ndarray, zoom: int) -> tuple[int, int, int, int, int]:
         """
         Auto zoom if necessary, and enumerate which map tiles we will need
 
@@ -185,8 +195,9 @@ class StravaVisualizer:
         :return: Tuple containing zoom, x_min, x_max, y_min, y_max
         """
         # Find tile coordinates
-        lat_min, lon_min = np.min(lat_lon_data, axis=0)
-        lat_max, lon_max = np.max(lat_lon_data, axis=0)
+        lat_min, lon_min, lat_max, lon_max = lat_lon_bounds
+        # lat_min, lon_min = np.min(lat_lon_data, axis=0)  # Auto crop to GPX data
+        # lat_max, lon_max = np.max(lat_lon_data, axis=0)
 
         # Handle auto zoom
         if zoom > -1:
@@ -225,7 +236,7 @@ class StravaVisualizer:
         :return: NumPy array containing the base map to use
         """
         tile_count = (x_max - x_min + 1) * (y_max - y_min + 1)
-        if tile_count > self.OPEN_STREET_MAPS_MAX_TILE_COUNT:
+        if not self._OVERRIDE_MAX_ZOOM and tile_count > self.OPEN_STREET_MAPS_MAX_TILE_COUNT:
             raise ValueError(f"Error: Too many tiles ({tile_count}) would need to be downloaded")
 
         base_map = np.zeros((
@@ -277,6 +288,7 @@ class StravaVisualizer:
             x_min: int,
             y_min: int,
             sigma: int,
+            brightness_factor: float,
             track_count: int
     ) -> np.ndarray:
         """
@@ -288,6 +300,7 @@ class StravaVisualizer:
         :param x_min: Minimum x
         :param y_min: Minimum y
         :param sigma: Pixel width of the tracks
+        :param brightness_factor: Manually adjust brightness
         :param track_count: Number of tracks used
         :return: NumPy array containing the overlayed tracks on the passed map
         """
@@ -303,7 +316,7 @@ class StravaVisualizer:
 
         # Account for maximum accumulation of a track point
         # See https://wiki.openstreetmap.org/wiki/Slippy_map_tilenames
-        res_pixel = 156543.03 * np.cos(np.radians(np.mean(lat_lon_data[:, 0]))) / (2 ** zoom)
+        res_pixel = 156543.03 * np.cos(np.radians(np.mean(lat_lon_data[:, 0]))) / (2 ** zoom) / brightness_factor
 
         # Trackpoint max accumulation per pixel = 1/5 (trackpoint/meter) * res_pixel (meter/pixel) * activities
         m = max(1.0, np.round((1.0 / 5.0) * res_pixel * track_count))
@@ -329,13 +342,13 @@ class StravaVisualizer:
             base_map[:, :, c] = (1.0 - data_color[:, :, c]) * base_map[:, :, c] + data_color[:, :, c]
 
         # Crop
-        i_min, j_min = np.min(ij_data, axis=0)
-        i_max, j_max = np.max(ij_data, axis=0)
+        # i_min, j_min = np.min(ij_data, axis=0)
+        # i_max, j_max = np.max(ij_data, axis=0)
 
-        base_map = base_map[
-                   max(i_min - self.MARGIN_SIZE, 0):min(i_max + self.MARGIN_SIZE, base_map.shape[0]),
-                   max(j_min - self.MARGIN_SIZE, 0):min(j_max + self.MARGIN_SIZE, base_map.shape[1])
-                   ]
+        # base_map = base_map[
+        #            max(i_min - self.MARGIN_SIZE, 0):min(i_max + self.MARGIN_SIZE, base_map.shape[0]),
+        #            max(j_min - self.MARGIN_SIZE, 0):min(j_max + self.MARGIN_SIZE, base_map.shape[1])
+        #            ]
 
         return base_map
 
@@ -345,7 +358,9 @@ class StravaVisualizer:
             file: str,
             zoom: int = -1,
             sigma: int = 1,
-            year_filter: int = None,
+            date_min: str = "1900-01-01",
+            date_max: str = "2100-12-31",
+            brightness_factor: float = 1.0,
             lat_lon_bounds: tuple[float, float, float, float] = (-90.0, -180.0, 90.0, 180.0)
     ) -> np.ndarray:
         """
@@ -355,17 +370,20 @@ class StravaVisualizer:
         :param file: Location to save the heatmap to
         :param zoom: Zoom level to use when fetching map tiles
         :param sigma: Width of the strava tracks
-        :param year_filter: Only use activities for this year
+        :param date_min: Use only GPX tracks with dates after this date
+        :param date_max: Use only GPX tracks with dates before this date
+        :param brightness_factor: Manually increase/decrease brightness
         :param lat_lon_bounds: Bounding latitudes/longitudes describing the map
         :return: NumPy array representation of the heatmap image
         """
         lat_lon_data, track_count = self._process_gpx_files(
             gpx_dir=gpx_dir,
-            year_filter=year_filter,
+            date_min=date_min,
+            date_max=date_max,
             lat_lon_bounds=lat_lon_bounds
         )
 
-        zoom, x_min, x_max, y_min, y_max = self._enumerate_tiles(lat_lon_data=lat_lon_data, zoom=zoom)
+        zoom, x_min, x_max, y_min, y_max = self._enumerate_tiles(lat_lon_bounds=lat_lon_bounds, zoom=zoom)
         base_map = self._construct_base_map(zoom=zoom, x_min=x_min, x_max=x_max, y_min=y_min, y_max=y_max)
         heatmap = self._overlay_tracks(
             base_map=base_map,
@@ -374,6 +392,7 @@ class StravaVisualizer:
             x_min=x_min,
             y_min=y_min,
             sigma=sigma,
+            brightness_factor=brightness_factor,
             track_count=track_count
         )
 
